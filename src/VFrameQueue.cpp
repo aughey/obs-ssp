@@ -19,6 +19,7 @@ along with this program; If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include "VFrameQueue.h"
 #include <QDebug>
+#include <obs-module.h>
 
 VFrameQueue::VFrameQueue() {
     maxTime = 0;
@@ -49,10 +50,10 @@ void VFrameQueue::setFrameTime(uint64_t time_us) {
 
 
 void VFrameQueue::enqueue(imf::SspH264Data data, uint64_t time_us, bool noDrop) {
-    QMutexLocker locker(&queueLock);
     uint8_t *copy_data = (uint8_t *)malloc(data.len);
     memcpy(copy_data, data.data, data.len);
     data.data = copy_data;
+    QMutexLocker locker(&queueLock);
     frameQueue.enqueue({data, time_us, noDrop});
     sem.release();
 }
@@ -62,49 +63,84 @@ void* VFrameQueue::pthread_run(void *q) {
     return nullptr;
 }
 
+VFrameQueue::Frame VFrameQueue::dequeue(int* depth) {
+    queueLock.lock();
+    if (!frameQueue.empty()) {
+        VFrameQueue::Frame f = frameQueue.dequeue();
+        queueLock.unlock();
+        return f;
+    }
+    queueLock.unlock();
+
+    sem.acquire();
+    QMutexLocker locker(&queueLock);
+    if (frameQueue.empty()) {
+        return Frame();
+    }
+    if (depth != 0) {
+        *depth = frameQueue.size();
+    }
+    return frameQueue.dequeue();
+}
+
 
 void VFrameQueue::run(VFrameQueue *q) {
     Frame current;
     uint64_t lastFrameTime = 0, lastStartTime = 0, processingTime = 0;
-    q->sem.acquire();
-    q->queueLock.lock();
-    if(q->frameQueue.empty()) {
-        q->queueLock.unlock();
-        return;
+    uint64_t lastprinttime = 0;
+
+    // We just wait until we get the first frame
+    while (true) {
+        current = q->dequeue();
+        if (current.data.data != 0) {
+            break;
+        }
     }
-    current = q->frameQueue.dequeue();
-    q->queueLock.unlock();
+
     lastStartTime = os_gettime_ns()/1000;
     q->callback(&current.data);
     lastFrameTime = current.time;
     processingTime = os_gettime_ns()/1000 - lastStartTime;
     free((void *)current.data.data);
+    lastprinttime = os_gettime_ns() / 1000;
+
     while(q->running){
-        q->sem.acquire();
-        q->queueLock.lock();
-        if(q->frameQueue.empty()) {
-            q->queueLock.unlock();
+        int queue_depth;
+        current = q->dequeue(&queue_depth);
+        if (current.data.data == 0) {
             continue;
         }
-        current = q->frameQueue.dequeue();
-        q->queueLock.unlock();
-        if(current.time < lastFrameTime){
-            free((void *)current.data.data);
-            continue;
+
+       /* if (os_gettime_ns() / 1000 >= lastprinttime + 500000) {
+            blog(LOG_WARNING, QString("Queue depth is at %1").arg(queue_depth).toStdString().c_str());
+            lastprinttime = os_gettime_ns() / 1000;
+        }*/
+
+        bool process_frame = true;
+        if (current.noDrop) {
+            process_frame = true;
+        } else if (current.time < lastFrameTime) {
+            blog(LOG_WARNING, QString("Dropping frame because frame time %1 is less than the last frame time %2").arg(current.time).arg(lastFrameTime).toStdString().c_str());
+            process_frame = false;
         }
-        if(current.noDrop){
-            lastStartTime = os_gettime_ns()/1000;
+        /*  else if (current.time - lastFrameTime + 15000 > processingTime) {
+            blog(LOG_WARNING, QString("Dropped frame at %1 processing time %2").arg(current.time - lastFrameTime).arg(processingTime).toStdString().c_str());
+            process_frame = false;
+        }*/
+        else if (queue_depth > 10) {
+            blog(LOG_WARNING, QString("Dropped frame at %1 because queue depth was %2").arg(current.time - lastFrameTime).arg(queue_depth).toStdString().c_str());
+            process_frame = false;
+        }
+        else {
+            process_frame = true;
+        }
+
+        lastStartTime = os_gettime_ns() / 1000;
+        lastFrameTime = current.time;
+        if(process_frame) {
             q->callback(&current.data);
-            lastFrameTime = current.time;
             processingTime = os_gettime_ns()/1000 - lastStartTime;
-        }else if(current.time - lastFrameTime + 15000 > processingTime){
-            lastStartTime = os_gettime_ns()/1000;
-            q->callback(&current.data);
-            lastFrameTime = current.time;
-            processingTime = os_gettime_ns()/1000 - lastStartTime;
-        } else {
-            qDebug() <<"dropped" << current.time - lastFrameTime << processingTime;
-        } // else we drop the frame
+        }
         free((void *)current.data.data);
     }
 }

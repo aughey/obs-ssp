@@ -27,6 +27,14 @@ along with this program; If not, see <https://www.gnu.org/licenses/>
 
 class VFrameQueue {
     struct Frame {
+        Frame() {
+            data.data = 0;
+        }
+        Frame(const imf::SspH264Data& d, uint64_t t, bool nod) {
+            data = d;
+            time = t;
+            noDrop = nod;
+        }
         imf::SspH264Data data;
         uint64_t time;
         bool noDrop;
@@ -39,8 +47,9 @@ public:
     void setFrameCallback(CallbackFunc);
     void start();
     void stop();
+    static void run(VFrameQueue* q);
 private:
-    static void run(VFrameQueue *q);
+    Frame dequeue(int *depth=0);
     static void *pthread_run(void *q);
     CallbackFunc callback;
     QQueue<Frame> frameQueue;
